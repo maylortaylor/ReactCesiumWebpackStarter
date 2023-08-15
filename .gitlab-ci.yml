@@ -1,0 +1,104 @@
+image: node:18.16.1-alpine3.18
+
+stages:
+  - prepare
+  - build
+  - push-image
+  - test
+  - release
+
+pre-check-validations:
+  stage: .pre
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  except:
+    - tags
+  # rules:
+  #   - if: $CI_PIPELINE_SOURCE == 'merge_request_event' && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH  # Run only on merge requests to main
+  script:
+    - VERSION=v$(cat package.json | grep version | grep -Eo '[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+')
+    - >
+      RES=$(release-cli get --tag-name $VERSION) 2>&1
+      echo $RES | grep "404 Not Found";
+      EXIT_STATUS=$?
+
+      if [ "$EXIT_STATUS" != "0" ]; then
+        echo "Release Version needs to be updated!"
+      fi
+
+prepare-tag-job:
+  stage: prepare # This stage must run before the release stage
+  script:
+    - >
+      if [ $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH ]; then
+        echo "VERSION=v$(cat package.json | grep version | grep -Eo '[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+')" >> variables.env
+      else
+        echo "VERSION=v$(cat package.json | grep version | grep -Eo '[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+')-SNAPSHOT" >> variables.env
+      fi
+  artifacts:
+    reports:
+      dotenv: variables.env
+  except:
+    - tags
+
+node-build:
+  stage: build
+  script:
+    - npm install
+    - npm run build
+  artifacts:
+    paths:
+      - dist/mda-ui
+      - node_modules/
+  except:
+    - tags
+
+docker-build:
+  image: docker:latest
+  stage: push-image
+  except:
+    - tags
+  services:
+    - name: docker:dind
+      alias: docker
+  variables:
+    DOCKER_TLS_CERTDIR: '/certs'
+  needs:
+    - job: prepare-tag-job
+      artifacts: true
+    - job: node-build
+      artifacts: true
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+    - docker build -t $CI_REGISTRY_IMAGE:$VERSION -t $CI_REGISTRY_IMAGE:latest .
+    - docker push "$CI_REGISTRY_IMAGE" --all-tags
+  # rules:
+  #   - if: ($CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH)
+
+container_scanning:
+  needs:
+    - job: prepare-tag-job
+      artifacts: true
+    - job: docker-build
+  variables:
+    CS_IMAGE: $CI_REGISTRY_IMAGE:latest
+
+release-job:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: prepare-tag-job
+      artifacts: true
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Run this job when commits are pushed or merged to the default branch
+  script:
+    - echo "running release_job for $VERSION"
+  release:
+    tag_name: '$VERSION'
+    description: 'Release for $VERSION'
+
+include:
+  - template: SAST.gitlab-ci.yml
+  - template: SAST-IaC.gitlab-ci.yml
+  - template: Secret-Detection.gitlab-ci.yml
+  - template: Dependency-Scanning.gitlab-ci.yml
+  - template: Container-Scanning.gitlab-ci.yml
